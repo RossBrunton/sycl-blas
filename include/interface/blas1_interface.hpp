@@ -38,6 +38,61 @@
 
 #include <SYCL/codeplay.hpp>
 
+namespace {
+/**
+ * \brief Copy data from source into tile
+ *
+ * This is an internal function used by the _tiled variants to copy data into
+ * scratch. It supports an offset into the non-tile data.
+ *
+ * @private
+ * @param Executor<ExecutorType> ex Executor
+ * @param tile The tile destination to copy into
+ * @param source The source buffer to copy from
+ * @param size The size of the data to copy
+ * @param base The base offset of the source only
+ */
+template <typename Executor, typename elemT>
+void _copy_into_scratch(Executor &ex, cl::sycl::buffer<elemT, 1> &tile,
+                        cl::sycl::buffer<elemT, 1> &source, size_t size,
+                        size_t base) {
+  ex.get_queue().submit([&](cl::sycl::handler &cgh) {
+    auto tile_acc =
+        tile.template get_access<cl::sycl::access::mode::discard_write>(
+            cgh, cl::sycl::range<1>(size), cl::sycl::id<1>(0));
+    auto range_acc = source.template get_access<cl::sycl::access::mode::read>(
+        cgh, cl::sycl::range<1>(size), cl::sycl::id<1>(base));
+    cgh.copy(range_acc, tile_acc);
+  });
+}
+
+/**
+ * \brief Copy data from tile into dest
+ *
+ * This is an internal function used by the _tiled variants to copy data out of
+ * scratch. It supports an offset into the non-tile data.
+ *
+ * @private
+ * @param Executor<ExecutorType> ex Executor
+ * @param tile The tile source to copy from
+ * @param source The destination to copy into
+ * @param size The size of the data to copy
+ * @param base The base offset of the destination only
+ */
+template <typename Executor, typename elemT>
+void _copy_from_scratch(Executor &ex, cl::sycl::buffer<elemT, 1> &tile,
+                        cl::sycl::buffer<elemT, 1> &dest, size_t size,
+                        size_t base) {
+  ex.get_queue().submit([&](cl::sycl::handler &cgh) {
+    auto tile_acc = tile.template get_access<cl::sycl::access::mode::read>(
+        cgh, cl::sycl::range<1>(size), cl::sycl::id<1>(0));
+    auto range_acc = dest.template get_access<cl::sycl::access::mode::write>(
+        cgh, cl::sycl::range<1>(size), cl::sycl::id<1>(base));
+    cgh.copy(tile_acc, range_acc);
+  });
+}
+}  // namespace
+
 namespace blas {
 /**
  * \brief AXPY constant times a vector plus a vector.
@@ -139,30 +194,12 @@ typename Executor::Return_Type _copy_tiled(Executor &ex, IndexType _N,
 
   for (IndexType i = 0; i < _N; i += _tile_size) {
     // Copy from _vx into vx_tile
-    ex.get_queue().submit([&](cl::sycl::handler &cgh) {
-      auto vx_tile_acc =
-          vx_tile.template get_access<cl::sycl::access::mode::discard_write>(
-              cgh, cl::sycl::range<1>(_tile_size * _incx), cl::sycl::id<1>(0));
-      auto vx_range_acc = vx.template get_access<cl::sycl::access::mode::read>(
-          cgh, cl::sycl::range<1>(_tile_size * _incx),
-          cl::sycl::id<1>(i * _incx));
-      cgh.copy(vx_range_acc, vx_tile_acc);
-    });
+    _copy_into_scratch(ex, vx_tile, vx, _tile_size * _incx, i * _incx);
 
     if (_incy != 1) {
       // If incy is not 1, then "empty" slots between the values will need to
       // be copied over (_vy into vy_tile) first
-      ex.get_queue().submit([&](cl::sycl::handler &cgh) {
-        auto vy_tile_acc =
-            vy_tile.template get_access<cl::sycl::access::mode::discard_write>(
-                cgh, cl::sycl::range<1>(_tile_size * _incy),
-                cl::sycl::id<1>(0));
-        auto vy_range_acc =
-            vy.template get_access<cl::sycl::access::mode::read>(
-                cgh, cl::sycl::range<1>(_tile_size * _incy),
-                cl::sycl::id<1>(i * _incy));
-        cgh.copy(vy_range_acc, vy_tile_acc);
-      });
+      _copy_into_scratch(ex, vy_tile, vy, _tile_size * _incy, i * _incy);
     }
 
     // Perform the actual assignment
@@ -170,15 +207,7 @@ typename Executor::Return_Type _copy_tiled(Executor &ex, IndexType _N,
     ret = ex.execute(assignOp);
 
     // Copy from vy_tile_acc back into _vy
-    ex.get_queue().submit([&](cl::sycl::handler &cgh) {
-      auto vy_tile_acc =
-          vy_tile.template get_access<cl::sycl::access::mode::read>(
-              cgh, cl::sycl::range<1>(_tile_size * _incy), cl::sycl::id<1>(0));
-      auto vy_range_acc = vy.template get_access<cl::sycl::access::mode::write>(
-          cgh, cl::sycl::range<1>(_tile_size * _incy),
-          cl::sycl::id<1>(i * _incy));
-      cgh.copy(vy_tile_acc, vy_range_acc);
-    });
+    _copy_from_scratch(ex, vy_tile, vy, _tile_size * _incy, i * _incy);
   }
 
   return ret;
