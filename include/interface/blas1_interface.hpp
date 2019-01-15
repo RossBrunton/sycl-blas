@@ -39,6 +39,49 @@
 #include <SYCL/codeplay.hpp>
 
 namespace {
+
+constexpr size_t gcd(size_t a, size_t b) { return b == 0 ? a : gcd(b, a % b); };
+constexpr size_t lcm(size_t a, size_t b) { return (a / gcd(a, b)) * b; };
+
+/**
+ * \brief Helper function for tiling
+ *
+ * This calls the provided function multiple times for given parameters. Think
+ * of it like "tiles" tracking over each of the two buffers. n can be any value;
+ * the last call will have a smaller tile size.
+ *
+ * @param n The number of values in the data set
+ * @param ytile_size The size of a single tile in the y vector
+ * @param incy The step between values in the y vector
+ * @param yscale How many y tiles are in a full tile
+ * @param xtile_size The size of a single tile in the x vector
+ * @param incx The step between values in the x vector
+ * @param xscale How many x tiles are in a full tile
+ * @param body The function to call for each tile pair, takes the the size and
+ * base of the x, then the y tiles
+ */
+template <typename IndexType>
+void tile(IndexType n, size_t ytile_size, size_t incy, size_t yscale,
+          size_t xtile_size, size_t incx, size_t xscale,
+          std::function<void(size_t, size_t, size_t, size_t)> body) {
+  for (IndexType i = 0;
+       i <= (n / std::max(ytile_size / incy, xtile_size / incx)); i++) {
+    size_t ycopy_size = ytile_size;
+    size_t xcopy_size = xtile_size;
+
+    // On the last iteration, only copy the remaining data
+    if (ytile_size > xtile_size && i == (n / (ytile_size / incy))) {
+      ycopy_size = ((n * incy) % ytile_size);
+      xcopy_size = (ycopy_size * yscale) / xscale;
+    } else if (xtile_size >= ytile_size && i == (n / (xtile_size / incx))) {
+      xcopy_size = ((n * incx) % xtile_size);
+      ycopy_size = (xcopy_size * xscale) / yscale;
+    }
+
+    body(xcopy_size, i * xtile_size, ycopy_size, i * ytile_size);
+  }
+}
+
 /**
  * \brief Copy data from source into tile
  *
@@ -155,19 +198,24 @@ template <typename Executor, typename IndexType, typename ContainerT0,
           typename ContainerT1, typename IncrementType>
 typename Executor::Return_Type _copy_tiled(Executor &ex, IndexType _N,
                                            ContainerT0 _vx, IncrementType _incx,
-                                           ContainerT1 _vy, IncrementType _incy,
-                                           size_t _tile_size) {
+                                           ContainerT1 _vy,
+                                           IncrementType _incy) {
   cl::sycl::event ret;
 
-  // For now, only use the tiled version when:
-  //   - _N `mod` _tile_size == 0
-  //   - (sizeof(ElemT) * _tile_size ) < _N (see ComputeCPP copy bug)
-  // Otherwise, fall back to the "default" copy
-  if (_N % _tile_size) {
-    std::cerr << "WARNING: REVERTING TO NORMAL COPY - CANNOT RUN TILED VARIANT!"
-              << std::endl;
-    return _copy(ex, _N, _vx, _incx, _vy, _incy);
-  }
+  // Note that this is a maximum tile size, it may be smaller if things need to
+  // be divided down
+  size_t tile_size = 1024;
+
+  // The scratch space will be different sizes based on the _inc values
+  // a yscale of 2 means that x is half the size of y (y will have twice the
+  // space between each input x value)
+  size_t yscale = _incx / gcd(_incx, _incy);
+  size_t xscale = _incy / gcd(_incx, _incy);
+
+  // Tile size must be divisible by _incx and _incy
+  tile_size -= tile_size % lcm(_incx, _incy);
+  size_t ytile_size = tile_size / yscale;
+  size_t xtile_size = tile_size / xscale;
 
   auto vx = ex.get_buffer(_vx).get_buffer();
   auto vy = ex.get_buffer(_vy).get_buffer();
@@ -177,9 +225,9 @@ typename Executor::Return_Type _copy_tiled(Executor &ex, IndexType _N,
       cl::sycl::codeplay::property::prefer);
 
   // Create sycl buffers for the tiles
-  cl::sycl::buffer<elemT, 1> vx_tile(cl::sycl::range<1>{_tile_size * _incx},
+  cl::sycl::buffer<elemT, 1> vx_tile(cl::sycl::range<1>{xtile_size},
                                      {ocm_property});
-  cl::sycl::buffer<elemT, 1> vy_tile(cl::sycl::range<1>{_tile_size * _incy},
+  cl::sycl::buffer<elemT, 1> vy_tile(cl::sycl::range<1>{ytile_size},
                                      {ocm_property});
 
   // Make vector views to the tiles, so that we can use the standard ops
@@ -188,27 +236,28 @@ typename Executor::Return_Type _copy_tiled(Executor &ex, IndexType _N,
   auto vy_tile_iterator_buffer =
       helper::make_sycl_iterator_buffer<elemT, IndexType>(vy_tile);
   auto vx_tile_view =
-      make_vector_view(ex, vx_tile_iterator_buffer, _incx, _tile_size);
+      make_vector_view(ex, vx_tile_iterator_buffer, _incx, xtile_size / _incx);
   auto vy_tile_view =
-      make_vector_view(ex, vy_tile_iterator_buffer, _incy, _tile_size);
+      make_vector_view(ex, vy_tile_iterator_buffer, _incy, ytile_size / _incy);
 
-  for (IndexType i = 0; i < _N; i += _tile_size) {
-    // Copy from _vx into vx_tile
-    _copy_into_scratch(ex, vx_tile, vx, _tile_size * _incx, i * _incx);
+  tile(_N, ytile_size, _incy, yscale, xtile_size, _incx, xscale,
+       [&](size_t xcopy_size, size_t xbase, size_t ycopy_size, size_t ybase) {
+         // Copy from _vx into vx_tile
+         _copy_into_scratch(ex, vx_tile, vx, xcopy_size, xbase);
 
-    if (_incy != 1) {
-      // If incy is not 1, then "empty" slots between the values will need to
-      // be copied over (_vy into vy_tile) first
-      _copy_into_scratch(ex, vy_tile, vy, _tile_size * _incy, i * _incy);
-    }
+         if (_incy != 1) {
+           // If incy is not 1, then "empty" slots between the values will need
+           // to be copied over (_vy into vy_tile) first
+           _copy_into_scratch(ex, vy_tile, vy, ycopy_size, ybase);
+         }
 
-    // Perform the actual assignment
-    auto assignOp = make_op<Assign>(vy_tile_view, vx_tile_view);
-    ret = ex.execute(assignOp);
+         // Perform the actual assignment
+         auto assignOp = make_op<Assign>(vy_tile_view, vx_tile_view);
+         ret = ex.execute(assignOp);
 
-    // Copy from vy_tile_acc back into _vy
-    _copy_from_scratch(ex, vy_tile, vy, _tile_size * _incy, i * _incy);
-  }
+         // Copy from vy_tile_acc back into _vy
+         _copy_from_scratch(ex, vy_tile, vy, ycopy_size, ybase);
+       });
 
   return ret;
 }

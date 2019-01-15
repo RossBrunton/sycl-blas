@@ -82,3 +82,56 @@ TYPED_TEST(BLAS_Test, swap_test) {
   ex.template deallocate<ScalarT>(gpu_vX);
   ex.template deallocate<ScalarT>(gpu_vY);
 }
+
+REGISTER_SIZE(::RANDOM_SIZE, swap_test_tiled)
+REGISTER_STRD(::RANDOM_STRD, swap_test_tiled)
+
+TYPED_TEST(BLAS_Test, swap_test_tiled) {
+  using ScalarT = typename TypeParam::scalar_t;
+  using ExecutorType = typename TypeParam::executor_t;
+  using TestClass = BLAS_Test<TypeParam>;
+  using test = class swap_test_tiled;
+
+  size_t tile_size = 64;
+  size_t size = TestClass::template test_size<test>();
+  long strd = TestClass::template test_strd<test>();
+  size -= size % (tile_size * strd);
+
+  DEBUG_PRINT(std::cout << "size == " << size << std::endl);
+  DEBUG_PRINT(std::cout << "strd == " << strd << std::endl);
+
+  // create two random vectors with the same size: vX and vY
+  std::vector<ScalarT> vX(size);
+  std::vector<ScalarT> vY(size);
+  TestClass::set_rand(vX, size);
+  TestClass::set_rand(vY, size);
+
+  // create two more vectors equal to vX and vY
+  std::vector<ScalarT> vZ = vX;
+  std::vector<ScalarT> vT = vY;
+
+  SYCL_DEVICE_SELECTOR d;
+  auto q = TestClass::make_queue(d);
+  Executor<ExecutorType> ex(q);
+  auto gpu_vX = ex.template allocate<ScalarT>(size);
+  auto gpu_vY = ex.template allocate<ScalarT>(size);
+  ex.copy_to_device(vX.data(), gpu_vX, size);
+  ex.copy_to_device(vY.data(), gpu_vY, size);
+  _swap_tiled(ex, size / strd, gpu_vX, strd, gpu_vY, strd, tile_size);
+  auto event0 = ex.copy_to_host(gpu_vX, vX.data(), size);
+  auto event1 = ex.copy_to_host(gpu_vY, vY.data(), size);
+  ex.wait(event0, event1);
+  // check that new vX is equal to the copy of the original vY and
+  // that new vY is equal to the copy of the original vX
+  for (size_t i = 0; i < size; ++i) {
+    if (i % strd == 0) {
+      ASSERT_EQ(vZ[i], vY[i]);
+      ASSERT_EQ(vT[i], vX[i]);
+    } else {
+      ASSERT_EQ(vZ[i], vX[i]);
+      ASSERT_EQ(vT[i], vY[i]);
+    }
+  }
+  ex.template deallocate<ScalarT>(gpu_vX);
+  ex.template deallocate<ScalarT>(gpu_vY);
+}
