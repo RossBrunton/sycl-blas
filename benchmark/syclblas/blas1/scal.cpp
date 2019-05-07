@@ -60,7 +60,7 @@ void run(benchmark::State& state, ExecutorType* executorPtr, index_t size) {
   // Measure
   for (auto _ : state) {
     // Run
-    std::tuple<double, double> times =
+    auto times =
         blas_benchmark::utils::timef([&]() -> std::vector<cl::sycl::event> {
           auto event = _scal(ex, size, alpha, in, 1);
           ex.get_policy_handler().wait(event);

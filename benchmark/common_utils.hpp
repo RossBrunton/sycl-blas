@@ -332,15 +332,16 @@ inline cl_ulong time_events(event_t first_event,
  * (both overall and event time, returned in nanoseconds in a tuple of double)
  */
 template <typename function_t, typename... args_t>
-static std::tuple<double, double> timef(function_t func, args_t&&... args) {
+static std::tuple<double, double, int> timef(function_t func, args_t&&... args) {
   auto start = std::chrono::system_clock::now();
   auto event = func(std::forward<args_t>(args)...);
   auto end = std::chrono::system_clock::now();
   double overall_time = (end - start).count();
 
   double event_time = static_cast<double>(time_events(event));
+  int kernels = event.size();
 
-  return std::make_tuple(overall_time, event_time);
+  return std::make_tuple(overall_time, event_time, kernels);
 }
 
 // Functions to initialize and update the counters
@@ -351,16 +352,18 @@ inline void init_counters(benchmark::State& state) {
 }
 
 inline void update_counters(benchmark::State& state,
-                            std::tuple<double, double> times) {
+                            std::tuple<double, double, int> times) {
   state.PauseTiming();
   double overall_time, event_time;
-  std::tie(overall_time, event_time) = times;
+  int kernels;
+  std::tie(overall_time, event_time, kernels) = times;
   state.counters["total_event_time"] += event_time;
   state.counters["best_event_time"] =
       std::min<double>(state.counters["best_event_time"], event_time);
   state.counters["total_overall_time"] += overall_time;
   state.counters["best_overall_time"] =
       std::min<double>(state.counters["best_overall_time"], overall_time);
+  state.counters["total_kernels"] += kernels;
   state.ResumeTiming();
 }
 
@@ -369,6 +372,8 @@ inline void calc_avg_counters(benchmark::State& state) {
       state.counters["total_event_time"] / state.iterations();
   state.counters["avg_overall_time"] =
       state.counters["total_overall_time"] / state.iterations();
+  state.counters["avg_kernels"] =
+      state.counters["total_kernels"] / state.iterations();
 }
 
 }  // namespace utils

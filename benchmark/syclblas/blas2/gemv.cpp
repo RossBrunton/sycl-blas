@@ -90,7 +90,7 @@ void run(benchmark::State& state, ExecutorType* executorPtr, int ti, index_t m,
   // Measure
   for (auto _ : state) {
     // Run
-    std::tuple<double, double> times =
+    auto times =
         blas_benchmark::utils::timef([&]() -> std::vector<cl::sycl::event> {
           auto event = _gemv(ex, *t_str, m, n, alpha, m_a_gpu, m, v_b_gpu, incX,
                              beta, v_c_gpu, incY);
